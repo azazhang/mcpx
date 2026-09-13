@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Workspace-agnostic wrapper for verified producer→consumer pipelines."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "helpers"))
+from verified_gate import begin_gate, mark_failed, publish_ready, require_ready, verify_unchanged  # noqa: E402
+
+
+def as_path(value: str, root: Path) -> Path:
+    p = Path(value)
+    return p.resolve() if p.is_absolute() else (root / p).resolve()
+
+
+def json_arg(text: str) -> dict:
+    v = json.loads(text)
+    if not isinstance(v, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return v
+
+
+def run_shell(command: str, cwd: Path) -> subprocess.CompletedProcess:
+    shell = os.environ.get("MCPX_SHELL") or os.environ.get("SHELL") or "/bin/sh"
+    return subprocess.run([shell, "-lc", command], cwd=cwd)
+
+
+def producer(args) -> int:
+    project_root = Path(args.project_root).resolve()
+    gate = as_path(args.gate, project_root)
+    result_json = as_path(args.result_json, project_root)
+    artifacts = [as_path(x, project_root) for x in args.artifact]
+    cwd = as_path(args.cwd, project_root) if args.cwd else project_root
+    build_id = begin_gate(gate, pipeline=args.pipeline, project_root=project_root, metadata=args.metadata_json)
+    proc = run_shell(args.command, cwd)
+    if proc.returncode != 0:
+        mark_failed(gate, pipeline=args.pipeline, build_id=build_id, reason="PRODUCER_COMMAND_FAILED", exit_code=proc.returncode)
+        print(json.dumps({"pipeline": args.pipeline, "build_id": build_id, "state": "FAILED", "producer_exit_code": proc.returncode}))
+        return proc.returncode
+    try:
+        result = json.loads(result_json.read_text(encoding="utf-8"))
+        if not isinstance(result, dict):
+            raise AssertionError("producer result JSON must be an object")
+        ready = publish_ready(
+            gate,
+            result,
+            pipeline=args.pipeline,
+            build_id=build_id,
+            project_root=project_root,
+            artifacts=artifacts,
+            expectations=args.expect_json,
+        )
+    except Exception as exc:
+        try:
+            mark_failed(gate, pipeline=args.pipeline, build_id=build_id, reason=f"READY_PUBLISH_FAILED: {exc}", exit_code=0)
+        except Exception:
+            pass
+        print(json.dumps({"pipeline": args.pipeline, "build_id": build_id, "state": "FAILED", "error": str(exc)}), file=sys.stderr)
+        return 65
+    print(json.dumps({
+        "pipeline": args.pipeline,
+        "build_id": build_id,
+        "state": ready["state"],
+        "artifact_count": len(ready["artifacts"]),
+        "expectations": ready.get("expectations", {}),
+    }, sort_keys=True))
+    return 0
+
+
+def consumer(args) -> int:
+    candidate_root = Path(args.candidate_root).resolve()
+    gate = as_path(args.gate, candidate_root)
+    cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd().resolve()
+    token = require_ready(gate, candidate_root=candidate_root, pipeline=args.pipeline, required_artifacts=args.artifact)
+    proc = run_shell(args.command, cwd)
+    try:
+        verify_unchanged(token)
+    except Exception as exc:
+        print(json.dumps({"pipeline": args.pipeline, "build_id": token.get("build_id"), "state": "INVALID", "error": str(exc)}), file=sys.stderr)
+        return 74
+    print(json.dumps({
+        "pipeline": args.pipeline,
+        "build_id": token.get("build_id"),
+        "state": "UNCHANGED",
+        "consumer_exit_code": proc.returncode,
+    }, sort_keys=True))
+    return proc.returncode
+
+
+def check(args) -> int:
+    candidate_root = Path(args.candidate_root).resolve()
+    gate = as_path(args.gate, candidate_root)
+    token = require_ready(gate, candidate_root=candidate_root, pipeline=args.pipeline, required_artifacts=args.artifact)
+    verify_unchanged(token)
+    print(json.dumps({"pipeline": args.pipeline, "build_id": token.get("build_id"), "state": "READY_VERIFIED"}, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Fail-closed verified producer/consumer wrapper.")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    p = sub.add_parser("producer", help="BUILDING → producer → validation → READY")
+    p.add_argument("--project-root", required=True)
+    p.add_argument("--gate", required=True)
+    p.add_argument("--pipeline", required=True)
+    p.add_argument("--result-json", required=True)
+    p.add_argument("--artifact", action="append", required=True)
+    p.add_argument("--expect-json", type=json_arg, default={})
+    p.add_argument("--metadata-json", type=json_arg, default={})
+    p.add_argument("--cwd")
+    p.add_argument("--command", required=True)
+    p.set_defaults(func=producer)
+
+    c = sub.add_parser("consumer", help="require READY → consumer → rehash")
+    c.add_argument("--candidate-root", required=True)
+    c.add_argument("--gate", required=True)
+    c.add_argument("--pipeline", required=True)
+    c.add_argument("--artifact", action="append", default=[])
+    c.add_argument("--cwd")
+    c.add_argument("--command", required=True)
+    c.set_defaults(func=consumer)
+
+    q = sub.add_parser("check", help="Verify READY and current hashes without running a consumer")
+    q.add_argument("--candidate-root", required=True)
+    q.add_argument("--gate", required=True)
+    q.add_argument("--pipeline", required=True)
+    q.add_argument("--artifact", action="append", default=[])
+    q.set_defaults(func=check)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,29 @@
+{
+  "name": "mcpx-control-plane",
+  "version": "0.1.0",
+  "description": "Durable MCP control plane for long-running agent workflows",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "build:filetxn": "bash scripts/build-filetxn.sh",
+    "start": "bash scripts/start.sh",
+    "check": "node --check server.js && node --check workspace-control/control-plane.js && node --check workspace-control/maintenance.js",
+    "test": "bash scripts/test.sh"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agents",
+    "workspaces",
+    "idempotency",
+    "recovery"
+  ],
+  "author": "A. Zhang",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0"
+  }
+}
