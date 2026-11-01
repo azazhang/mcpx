@@ -24,6 +24,6 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0"
+    "@modelcontextprotocol/server": "2.4.0"
   }
 }
